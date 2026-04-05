@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 "HESTIA Ternary training script for Parameter Golf. Fork of Ciprian-Florin Ifrim's ternary submission with novel additions: HESTIA QAT, 2:4 structured sparsity, GPTQ-ternary, EGGROLL."
 
 import copy
@@ -1250,8 +1251,10 @@ def main() -> None:
     if args.hestia_enabled and master_process:
         log0("Computing Hutch++ sensitivities...")
         train_loader_tmp = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        calib_batch = train_loader_tmp.stream.take(args.train_seq_len * 8 + 1)
-        calib_batch = calib_batch[:args.train_seq_len * 8 + 1].to(device).long().reshape(8, -1)
+        n_calib_seqs = 8
+        calib_tokens_needed = n_calib_seqs * (args.train_seq_len + 1)
+        calib_batch = train_loader_tmp.stream.take(calib_tokens_needed)
+        calib_batch = calib_batch[:calib_tokens_needed].to(device).long().reshape(n_calib_seqs, -1)
         sensitivities = estimate_sensitivities(base_model, calib_batch, device, args.bitnet_group_size)
         for name, module in base_model.named_modules():
             if isinstance(module, HestiaTernaryLinear) and name in sensitivities:
