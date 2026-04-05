@@ -92,7 +92,7 @@ class TestHESTIA(unittest.TestCase):
         w = torch.randn(64, 128, requires_grad=True)
         tau = torch.tensor(0.3)
         pressure = torch.tensor(0.0)
-        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity=0.0)
+        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0)
         self.assertEqual(out.shape, w.shape)
         out.sum().backward()
         self.assertIsNotNone(w.grad)
@@ -101,7 +101,7 @@ class TestHESTIA(unittest.TestCase):
         w = torch.randn(64, 128, requires_grad=True)
         tau = torch.tensor(0.1)
         pressure = torch.tensor(0.5)
-        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity=0.0)
+        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0)
         self.assertEqual(out.shape, w.shape)
         out.sum().backward()
         self.assertIsNotNone(w.grad)
@@ -154,26 +154,38 @@ class TestGPTQTernary(unittest.TestCase):
 
     def test_reduces_reconstruction_error(self):
         torch.manual_seed(42)
+        group_size = 64
         W = torch.randn(64, 128) * 0.02
         X = torch.randn(256, 128)
         H = (X.T @ X) / X.shape[0]
-        scale = W.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+        # Per-group scales (matching what q_sd computes)
+        W_grouped = W.reshape(-1, group_size)
+        scale = W_grouped.abs().mean(-1, keepdim=True).clamp(min=1e-8)
+        # Per-row scale for naive comparison
+        row_scale = W.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        Q_naive = (W / scale).round().clamp(-1, 1)
-        Q_gptq = T.gptq_ternary_quantize(W, H, scale)
+        Q_naive = (W / row_scale).round().clamp(-1, 1)
+        Q_gptq = T.gptq_ternary_quantize(W, H, scale, group_size)
 
-        naive_err = ((X @ (Q_naive * scale).T - X @ W.T) ** 2).mean().item()
-        gptq_err = ((X @ (Q_gptq * scale).T - X @ W.T) ** 2).mean().item()
+        # Reconstruct using per-group scales
+        naive_recon = Q_naive * row_scale
+        gptq_grouped = Q_gptq.reshape(-1, group_size)
+        gptq_recon = (gptq_grouped * scale).reshape(W.shape)
 
-        self.assertLess(gptq_err, naive_err * 1.1,  # allow small tolerance
+        naive_err = ((X @ naive_recon.T - X @ W.T) ** 2).mean().item()
+        gptq_err = ((X @ gptq_recon.T - X @ W.T) ** 2).mean().item()
+
+        self.assertLess(gptq_err, naive_err * 1.1,
                         f"GPTQ ({gptq_err:.6f}) should improve on naive ({naive_err:.6f})")
 
     def test_output_is_valid_ternary(self):
+        group_size = 64
         W = torch.randn(32, 64) * 0.02
         X = torch.randn(128, 64)
         H = (X.T @ X) / X.shape[0]
-        scale = W.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
-        Q = T.gptq_ternary_quantize(W, H, scale)
+        W_grouped = W.reshape(-1, group_size)
+        scale = W_grouped.abs().mean(-1, keepdim=True).clamp(min=1e-8)
+        Q = T.gptq_ternary_quantize(W, H, scale, group_size)
         self.assertTrue(((Q == -1) | (Q == 0) | (Q == 1)).all())
 
 

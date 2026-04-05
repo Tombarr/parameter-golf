@@ -166,38 +166,52 @@ def enforce_2_4_structure(w_continuous: Tensor) -> Tensor:
     return result.reshape(-1)[:w_continuous.numel()].reshape(orig_shape)
 
 def pack_2_4_ternary(q: Tensor) -> tuple[bytes, int]:
-    """Pack 2:4 structured ternary weights. Each group of 4 → 1 byte."""
+    """Pack 2:4 structured ternary weights. Fully vectorized — no Python loops."""
     flat = q.reshape(-1)
-    # Pad to multiple of 4
     pad4 = (4 - flat.numel() % 4) % 4
     if pad4 > 0:
         flat = F.pad(flat, (0, pad4))
     groups = flat.reshape(-1, 4).to(torch.int8).cpu().numpy()
     n_groups = groups.shape[0]
-    packed = np.zeros(n_groups, dtype=np.uint8)
-    for i in range(n_groups):
-        g = groups[i]
-        nz = tuple(np.where(g != 0)[0])
-        if len(nz) != 2:
-            nz = (0, 1)
-        pidx = PATTERN_TO_IDX.get(nz, 0)
-        s0 = 1 if g[nz[0]] > 0 else 0
-        s1 = 1 if g[nz[1]] > 0 else 0
-        packed[i] = pidx * 4 + s0 * 2 + s1
+    nz_mask = (groups != 0)  # (n_groups, 4) bool
+    # Encode nonzero pattern as sorted pair of positions
+    # Map each 2-of-4 pattern to index 0-5 via lookup
+    # Positions of nonzeros: use argwhere-style vectorized approach
+    nz_pos = np.zeros((n_groups, 2), dtype=np.int8)
+    for col in range(4):
+        # For groups where this column is the first nonzero
+        is_first = nz_mask[:, col] & (nz_mask[:, :col].sum(axis=1) == 0)
+        nz_pos[is_first, 0] = col
+        # For groups where this column is the second nonzero
+        is_second = nz_mask[:, col] & (nz_mask[:, :col].sum(axis=1) == 1)
+        nz_pos[is_second, 1] = col
+    # Pattern index lookup: (p0*4+p1) -> pidx. Build full lookup table.
+    pair_to_pidx = np.zeros(16, dtype=np.uint8)  # max p0=3, p1=3 -> idx 15
+    for pidx, (p0, p1) in enumerate(PATTERNS_24):
+        pair_to_pidx[p0 * 4 + p1] = pidx
+    pidx_arr = pair_to_pidx[nz_pos[:, 0] * 4 + nz_pos[:, 1]]
+    # Sign bits
+    s0 = (groups[np.arange(n_groups), nz_pos[:, 0]] > 0).astype(np.uint8)
+    s1 = (groups[np.arange(n_groups), nz_pos[:, 1]] > 0).astype(np.uint8)
+    packed = (pidx_arr * 4 + s0 * 2 + s1).astype(np.uint8)
     return packed.tobytes(), n_groups
 
 def unpack_2_4_ternary(data: bytes, n_groups: int) -> Tensor:
-    """Unpack 2:4 structured ternary weights from packed bytes."""
+    """Unpack 2:4 structured ternary weights. Fully vectorized — no Python loops."""
     packed = np.frombuffer(data, dtype=np.uint8)[:n_groups]
+    pidx = packed // 4
+    signs = packed % 4
+    s0 = np.where(signs & 2, np.int8(1), np.int8(-1))
+    s1 = np.where(signs & 1, np.int8(1), np.int8(-1))
+    # Build pattern position lookup arrays
+    p0_lut = np.array([p[0] for p in PATTERNS_24], dtype=np.int8)
+    p1_lut = np.array([p[1] for p in PATTERNS_24], dtype=np.int8)
+    pos0 = p0_lut[pidx]
+    pos1 = p1_lut[pidx]
     result = np.zeros((n_groups, 4), dtype=np.int8)
-    for i in range(n_groups):
-        val = int(packed[i])
-        pidx, signs = val // 4, val % 4
-        s0 = 1 if (signs & 2) else -1
-        s1 = 1 if (signs & 1) else -1
-        p0, p1 = PATTERNS_24[pidx]
-        result[i, p0] = s0
-        result[i, p1] = s1
+    rows = np.arange(n_groups)
+    result[rows, pos0] = s0
+    result[rows, pos1] = s1
     return torch.from_numpy(result.reshape(-1))
 
 # ---------------------------------------------------------------------------
@@ -253,20 +267,25 @@ _HESTIA_TAU = 0.3
 _HESTIA_PRESSURE = 0.0
 _HESTIA_ENABLED = True
 
+_HESTIA_GRID = {}  # cached per-device grid tensors
+
 def hestia_soft_quantize(w_grouped: Tensor, scale: Tensor, tau: Tensor) -> Tensor:
     """Softmax relaxation over ternary grid {-1, 0, 1}.
     tau must be a scalar Tensor (not Python float) for torch.compile compatibility."""
-    grid = torch.tensor([-1.0, 0.0, 1.0], device=w_grouped.device, dtype=w_grouped.dtype)
+    key = (w_grouped.device, w_grouped.dtype)
+    if key not in _HESTIA_GRID:
+        _HESTIA_GRID[key] = torch.tensor([-1.0, 0.0, 1.0], device=key[0], dtype=key[1])
+    grid = _HESTIA_GRID[key]
     w_norm = (w_grouped / scale).unsqueeze(-1)
     logits = -((w_norm - grid) ** 2) / tau.clamp(min=1e-7)
     probs = F.softmax(logits, dim=-1)
     return scale * (probs * grid).sum(dim=-1)
 
 def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Tensor,
-                           sensitivity: float = 0.0) -> Tensor:
+                           sensitivity_exp: float = 1.0) -> Tensor:
     """HESTIA-aware ternary forward pass. Replaces standard STE.
     tau and pressure are scalar Tensors (buffers) for torch.compile compatibility.
-    Uses torch.where instead of Python if/else to avoid graph breaks."""
+    sensitivity_exp is precomputed exp(0.4 * sensitivity) — a Python float constant per-layer."""
     w_bf = w.bfloat16()
     g = group_size
     w_g = w_bf.reshape(-1, g)
@@ -276,13 +295,12 @@ def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Te
     q = (w_g / scale).round().clamp(-1, 1)
     w_ste = w_g + ((q * scale) - w_g).detach()
 
-    # Always compute HESTIA soft path (only adds cost when pressure > 0)
-    tau_eff = tau * math.exp(0.4 * sensitivity)
+    # Always compute HESTIA soft path
+    tau_eff = tau * sensitivity_exp  # sensitivity_exp is constant, no graph break
     w_soft = hestia_soft_quantize(w_g, scale, tau_eff.clamp(min=1e-7))
     w_hestia = (1.0 - pressure) * w_g + pressure * w_soft
 
     # Blend: use HESTIA when pressure > 0, otherwise STE
-    # torch.where avoids Python branching → no graph break
     w_eff = torch.where(pressure > 0, w_hestia, w_ste)
 
     return w_eff.reshape(w.shape)
@@ -290,22 +308,37 @@ def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Te
 # ---------------------------------------------------------------------------
 # GPTQ-Ternary: Post-training error compensation on ternary grid
 # ---------------------------------------------------------------------------
-def gptq_ternary_quantize(W: Tensor, H: Tensor, scale: Tensor) -> Tensor:
+def gptq_ternary_quantize(W: Tensor, H: Tensor, group_scales: Tensor, group_size: int) -> Tensor:
     """
     GPTQ error compensation adapted for ternary {-1,0,1}.
-    W: (out, in) float, H: (in, in) Hessian, scale: (out, 1) per-row.
-    Returns: (out, in) ternary values {-1,0,1}.
+    Uses per-group scales (matching dequantization) to avoid scale mismatch.
+
+    W: (out, in) float weight matrix
+    H: (in, in) Hessian approximation
+    group_scales: (n_groups, 1) per-group absmax scales, where n_groups = (out * padded_in) / group_size
+    group_size: number of columns per scale group
+    Returns: (out, in) ternary values {-1,0,1}
     """
     W = W.clone().float()
     n_out, n_in = W.shape
     Q = torch.zeros_like(W)
     damp = 0.01 * H.diag().mean().clamp(min=1e-6)
     H = H + damp * torch.eye(n_in, device=H.device, dtype=H.dtype)
-    scale_sq = scale.squeeze(-1)
+
+    # Build per-element scale matrix from group scales
+    # group_scales is shaped (n_out * n_groups_per_row, 1) after reshape
+    n_groups_per_row = (n_in + group_size - 1) // group_size
+    scale_matrix = group_scales.squeeze(-1).reshape(n_out, n_groups_per_row)
+    # Expand to per-column: each column j uses scale from group j // group_size
+    col_group_idx = torch.arange(n_in) // group_size
+    col_group_idx = col_group_idx.clamp(max=n_groups_per_row - 1)
+    scale_per_col = scale_matrix[:, col_group_idx]  # (n_out, n_in)
+
     for j in range(n_in):
         w_col = W[:, j]
-        q_val = (w_col / scale_sq).round().clamp(-1, 1)
-        q_col = q_val * scale_sq
+        s_col = scale_per_col[:, j]  # per-row scale for this column's group
+        q_val = (w_col / s_col).round().clamp(-1, 1)
+        q_col = q_val * s_col
         Q[:, j] = q_val
         error = w_col - q_col
         if j + 1 < n_in:
@@ -507,10 +540,9 @@ def q_sd(state_dict: dict, group_size: int = 128, fp_storage=False,
             scale = t_grouped.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
 
             if gptq_hessians and name in gptq_hessians:
-                # GPTQ error compensation before quantization
+                # GPTQ error compensation using per-group scales (matching dequantization)
                 H = gptq_hessians[name].cpu().float()
-                row_scale = scale.reshape(t.shape[0], -1).mean(dim=1, keepdim=True)
-                q_raw = gptq_ternary_quantize(t, H, row_scale)
+                q_raw = gptq_ternary_quantize(t, H, scale, group_size)
                 q = F.pad(q_raw, (0, pad)) if pad > 0 else q_raw
                 q = q.reshape(-1, group_size)
             else:
@@ -793,16 +825,25 @@ class HestiaTernaryLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=False, group_size=128):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
-        self.sensitivity = 0.0  # set by Hutch++ estimation
-        # Tensor buffers — updated by the training loop, read by torch.compile
+        self._sensitivity = 0.0
+        self._sensitivity_exp = 1.0  # precomputed exp(0.4 * sensitivity)
         self.register_buffer("hestia_tau", torch.tensor(0.3), persistent=False)
         self.register_buffer("hestia_pressure", torch.tensor(0.0), persistent=False)
+
+    @property
+    def sensitivity(self):
+        return self._sensitivity
+
+    @sensitivity.setter
+    def sensitivity(self, val):
+        self._sensitivity = val
+        self._sensitivity_exp = math.exp(0.4 * val)
 
     def forward(self, x: Tensor) -> Tensor:
         w_ternary = hestia_ternary_forward(
             self.weight, self.group_size,
             self.hestia_tau, self.hestia_pressure,
-            self.sensitivity)
+            self._sensitivity_exp)
         return F.linear(x, w_ternary.to(x.dtype),
                         self.bias.to(x.dtype) if self.bias is not None else None)
 
