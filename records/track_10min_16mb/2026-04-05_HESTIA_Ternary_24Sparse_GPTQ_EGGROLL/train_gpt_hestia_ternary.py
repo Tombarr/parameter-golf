@@ -595,8 +595,7 @@ def deq_sd(quantized: dict, target_dtype=torch.bfloat16):
             q = unpack_ternary(entry["packed"], entry["n_trits"])
             q = q.float().reshape(-1, entry["group_size"])
             scale = entry["scale"].float().unsqueeze(-1)
-            q_absmean = q.abs().mean(-1, keepdim=True).clamp(min=1e-8)
-            t = (q * (scale / q_absmean)).reshape(-1, entry["padded_cols"])
+            t = (q * scale).reshape(-1, entry["padded_cols"])
             shape = entry["shape"]
             result = t[:shape[0], :shape[1]].to(target_dtype)
             orig = entry.get("orig_shape")
@@ -1168,7 +1167,7 @@ def eval_val_sliding(args, model, rank, world_size, device, grad_accum_steps, va
             starts_t = torch.tensor(batch_starts, dtype=torch.int64)
             offsets = torch.arange(seq_len + 1, dtype=torch.int64)
             indices = starts_t.unsqueeze(1) + offsets.unsqueeze(0)
-            local_batch = val_tokens[indices].to(device=device, dtype=torch.int64, non_blocking=True)
+            local_batch = val_tokens.long()[indices].to(device=device, dtype=torch.int64, non_blocking=True)
             x, y = local_batch[:, :-1], local_batch[:, 1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 ptl = model(x, y, reduction="none", temperature=temperature).detach()
