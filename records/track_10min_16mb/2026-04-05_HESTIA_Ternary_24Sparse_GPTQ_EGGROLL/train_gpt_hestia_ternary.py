@@ -258,22 +258,25 @@ def hestia_soft_quantize(w_grouped: Tensor, scale: Tensor, tau: Tensor) -> Tenso
 def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Tensor,
                            sensitivity: float = 0.0) -> Tensor:
     """HESTIA-aware ternary forward pass. Replaces standard STE.
-    tau and pressure are scalar Tensors (buffers) for torch.compile compatibility."""
+    tau and pressure are scalar Tensors (buffers) for torch.compile compatibility.
+    Uses torch.where instead of Python if/else to avoid graph breaks."""
     w_bf = w.bfloat16()
     g = group_size
     w_g = w_bf.reshape(-1, g)
     scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
 
-    # Use tensor comparisons so torch.compile doesn't guard on Python values
-    if pressure.item() > 0 and tau.item() > 1e-7:
-        # HESTIA soft quantization with per-tensor adaptive temperature
-        tau_eff = tau * math.exp(0.4 * sensitivity)
-        w_soft = hestia_soft_quantize(w_g, scale, tau_eff)
-        w_eff = (1.0 - pressure) * w_g + pressure * w_soft
-    else:
-        # Standard STE fallback (also used when tau is tiny)
-        q = (w_g / scale).round().clamp(-1, 1)
-        w_eff = w_bf.reshape(-1, g) + ((q * scale) - w_bf.reshape(-1, g)).detach()
+    # Always compute STE path (cheap)
+    q = (w_g / scale).round().clamp(-1, 1)
+    w_ste = w_g + ((q * scale) - w_g).detach()
+
+    # Always compute HESTIA soft path (only adds cost when pressure > 0)
+    tau_eff = tau * math.exp(0.4 * sensitivity)
+    w_soft = hestia_soft_quantize(w_g, scale, tau_eff.clamp(min=1e-7))
+    w_hestia = (1.0 - pressure) * w_g + pressure * w_soft
+
+    # Blend: use HESTIA when pressure > 0, otherwise STE
+    # torch.where avoids Python branching → no graph break
+    w_eff = torch.where(pressure > 0, w_hestia, w_ste)
 
     return w_eff.reshape(w.shape)
 
