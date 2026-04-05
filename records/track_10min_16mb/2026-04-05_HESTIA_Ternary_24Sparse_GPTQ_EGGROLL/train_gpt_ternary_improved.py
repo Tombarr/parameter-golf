@@ -82,6 +82,12 @@ class Hyperparameters:
     activation_type = _e("ACTIVATION", "swiglu")
     embed_dim = _e("EMBED_DIM", 0, int)
     bigram_hash = _e("BIGRAM_HASH", 0, bool)
+    engram_enabled = _e("ENGRAM", 0, bool)
+    engram_heads = _e("ENGRAM_HEADS", 4, int)
+    engram_buckets = _e("ENGRAM_BUCKETS", 1021, int)  # prime
+    engram_dim = _e("ENGRAM_DIM", 64, int)
+    engram_trigram = _e("ENGRAM_TRIGRAM", 0, bool)
+    engram_trigram_buckets = _e("ENGRAM_TRIGRAM_BUCKETS", 2039, int)  # prime
     mtp_heads_count = _e("MTP_HEADS", 0, int)
     training_depth_recurrence = _e("TRAINING_DEPTH_RECURRENCE", 1, int)
     eval_depth_recurrence = _e("EVAL_DEPTH_RECURRENCE", 1, int)
@@ -210,7 +216,7 @@ def q_sd(state_dict: dict, group_size: int = 64, fp_storage=False, ternary_metho
             t = t.reshape(t.shape[0], -1)
         is_ternary_candidate = (
             t.ndim == 2 and t.numel() > 65_536
-            and "tok_emb" not in name and "lm_head" not in name and "embed_proj" not in name and "bigram_emb" not in name and "lm_head_correction" not in name and "lm_head_U" not in name and "lm_head_V" not in name
+            and "tok_emb" not in name and "lm_head" not in name and "embed_proj" not in name and "bigram_emb" not in name and "engram" not in name and "lm_head_correction" not in name and "lm_head_U" not in name and "lm_head_V" not in name
             and "prototypes" not in name and "tversky" not in name
         ) or (ternary_override_names is not None and name in ternary_override_names)
         if is_ternary_candidate:
@@ -473,6 +479,98 @@ class QATEmbedding(nn.Embedding):
         w_qat = apply_qat_ste(self.weight, self.fp_storage)
         return F.embedding(input, w_qat, self.padding_idx, self.max_norm,
                            self.norm_type, self.scale_grad_by_freq, self.sparse)
+
+class EngramEmbedding(nn.Module):
+    """Multi-head N-gram hash embedding inspired by Engram (arXiv:2601.07372).
+    Uses K independent multiplicative-XOR hash functions into prime-sized tables,
+    reducing collisions vs single-hash BigramHash. Optionally adds trigram lookups.
+    Zero-init for stable training start. FP8/FP16 storage (not ternary)."""
+
+    # Hash primes per head — coprime multipliers for independent hash functions
+    _HASH_PRIMES = [36313, 27191, 50261, 73121, 91967, 15823, 43793, 67049]
+
+    def __init__(self, num_heads: int, buckets: int, dim_per_head: int, model_dim: int,
+                 trigram: bool = False, trigram_buckets: int = 2039,
+                 fp_storage: str | bool = False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.buckets = buckets
+        self.dim_per_head = dim_per_head
+        self.trigram = trigram
+        self.trigram_buckets = trigram_buckets
+        self.fp_storage = fp_storage
+        total_dim = num_heads * dim_per_head
+
+        # Bigram tables: K heads, each with its own prime-sized table
+        self.bigram_tables = nn.ModuleList([
+            nn.Embedding(buckets, dim_per_head) for _ in range(num_heads)
+        ])
+        for table in self.bigram_tables:
+            nn.init.zeros_(table.weight)
+
+        # Trigram tables (optional)
+        if trigram:
+            self.trigram_tables = nn.ModuleList([
+                nn.Embedding(trigram_buckets, dim_per_head) for _ in range(num_heads)
+            ])
+            for table in self.trigram_tables:
+                nn.init.zeros_(table.weight)
+            total_dim *= 2  # bigram + trigram concatenated
+
+        # Project concatenated heads to model_dim
+        self.proj = nn.Linear(total_dim, model_dim, bias=False) if total_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def _bigram_hash(self, tokens: Tensor, head_idx: int) -> Tensor:
+        """Multiplicative-XOR hash for bigrams: h(t_{i-1}, t_i)."""
+        t = tokens.to(torch.int32)
+        p1 = self._HASH_PRIMES[head_idx * 2 % len(self._HASH_PRIMES)]
+        p2 = self._HASH_PRIMES[(head_idx * 2 + 1) % len(self._HASH_PRIMES)]
+        out = torch.empty_like(t)
+        out[..., 0] = self.buckets - 1  # sentinel for position 0
+        out[..., 1:] = (torch.bitwise_xor(p1 * t[..., 1:], p2 * t[..., :-1])).abs() % self.buckets
+        return out.long()
+
+    def _trigram_hash(self, tokens: Tensor, head_idx: int) -> Tensor:
+        """Multiplicative-XOR hash for trigrams: h(t_{i-2}, t_{i-1}, t_i)."""
+        t = tokens.to(torch.int32)
+        p1 = self._HASH_PRIMES[head_idx % len(self._HASH_PRIMES)]
+        p2 = self._HASH_PRIMES[(head_idx + 3) % len(self._HASH_PRIMES)]
+        p3 = self._HASH_PRIMES[(head_idx + 5) % len(self._HASH_PRIMES)]
+        out = torch.full_like(t, self.trigram_buckets - 1)
+        out[..., 2:] = (torch.bitwise_xor(
+            torch.bitwise_xor(p1 * t[..., 2:], p2 * t[..., 1:-1]),
+            p3 * t[..., :-2]
+        )).abs() % self.trigram_buckets
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        # Bigram lookups: K heads concatenated
+        bigram_parts = []
+        for k in range(self.num_heads):
+            idx = self._bigram_hash(token_ids, k)
+            w = self.bigram_tables[k].weight
+            if self.fp_storage:
+                w = apply_qat_ste(w, self.fp_storage)
+            bigram_parts.append(F.embedding(idx, w))
+        h = torch.cat(bigram_parts, dim=-1)
+
+        # Trigram lookups (optional)
+        if self.trigram:
+            trigram_parts = []
+            for k in range(self.num_heads):
+                idx = self._trigram_hash(token_ids, k)
+                w = self.trigram_tables[k].weight
+                if self.fp_storage:
+                    w = apply_qat_ste(w, self.fp_storage)
+                trigram_parts.append(F.embedding(idx, w))
+            h = torch.cat([h] + trigram_parts, dim=-1)
+
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
 
 class TernaryLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=False, group_size=64):
@@ -817,7 +915,9 @@ class GPT(nn.Module):
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn=False, mlp_groups=0, refiner=False, refiner_kernel=3,
-                 ln_scale=False, xsa_last_n=0, rope_dims=0, overtone_init=False):
+                 ln_scale=False, xsa_last_n=0, rope_dims=0, overtone_init=False,
+                 engram_enabled=False, engram_heads=4, engram_buckets=1021,
+                 engram_dim=64, engram_trigram=False, engram_trigram_buckets=2039):
         super().__init__()
         self.training_depth_recurrence = training_depth_recurrence
         self.fp_storage = fp_storage
@@ -829,6 +929,11 @@ class GPT(nn.Module):
         self.bigram_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage) if bigram_hash else None
         if self.bigram_emb is not None:
             nn.init.zeros_(self.bigram_emb.weight)
+        self.engram = EngramEmbedding(
+            num_heads=engram_heads, buckets=engram_buckets, dim_per_head=engram_dim,
+            model_dim=self.embed_dim, trigram=engram_trigram,
+            trigram_buckets=engram_trigram_buckets, fp_storage=fp_storage,
+        ) if engram_enabled else None
         self.lm_head_correction = nn.Parameter(
             torch.zeros(vocab_size, self.embed_dim)) if tie_embeddings == 2 else None
         self.embed_proj = QATLinear(self.embed_dim, model_dim, bias=False, fp_storage=fp_storage) if self.embed_dim != model_dim else None
@@ -936,6 +1041,8 @@ class GPT(nn.Module):
         if self.bigram_emb is not None:
             prev = F.pad(input_ids[:, :-1], (1, 0), value=0)
             x = x + self.bigram_emb(prev).float()
+        if self.engram is not None:
+            x = x + self.engram(input_ids).float()
         if self.embed_proj is not None:
             x = self.embed_proj(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1196,6 +1303,9 @@ def main() -> None:
         refiner=args.refiner, refiner_kernel=args.refiner_kernel, mlp_groups=args.mlp_groups,
         ln_scale=args.ln_scale, xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims,
         overtone_init=args.overtone_init,
+        engram_enabled=args.engram_enabled, engram_heads=args.engram_heads,
+        engram_buckets=args.engram_buckets, engram_dim=args.engram_dim,
+        engram_trigram=args.engram_trigram, engram_trigram_buckets=args.engram_trigram_buckets,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
