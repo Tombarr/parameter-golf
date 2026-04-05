@@ -84,7 +84,7 @@ class Hyperparameters:
     softcap_type = _e("SOFTCAP_TYPE", "poly")
     tied_embed_init_std = _e("TIED_EMBED_INIT_STD", 0.005, float)
     qk_gain_init = _e("QK_GAIN_INIT", 2.25, float)
-    activation_type = _e("ACTIVATION", "relu2")
+    activation_type = _e("ACTIVATION", "leaky_relu2")
     embed_dim = _e("EMBED_DIM", 254, int)
     bigram_hash = _e("BIGRAM_HASH", 0, bool)
     mtp_heads_count = _e("MTP_HEADS", 0, int)
@@ -267,40 +267,36 @@ _HESTIA_TAU = 0.3
 _HESTIA_PRESSURE = 0.0
 _HESTIA_ENABLED = True
 
-_HESTIA_GRID = {}  # cached per-device grid tensors
-
-def hestia_soft_quantize(w_grouped: Tensor, scale: Tensor, tau: Tensor) -> Tensor:
+def hestia_soft_quantize(w_grouped: Tensor, scale: Tensor, tau: Tensor, grid: Tensor) -> Tensor:
     """Softmax relaxation over ternary grid {-1, 0, 1}.
-    tau must be a scalar Tensor (not Python float) for torch.compile compatibility."""
-    key = (w_grouped.device, w_grouped.dtype)
-    if key not in _HESTIA_GRID:
-        _HESTIA_GRID[key] = torch.tensor([-1.0, 0.0, 1.0], device=key[0], dtype=key[1])
-    grid = _HESTIA_GRID[key]
+    All args are Tensors for torch.compile compatibility. grid is a registered buffer."""
     w_norm = (w_grouped / scale).unsqueeze(-1)
     logits = -((w_norm - grid) ** 2) / tau.clamp(min=1e-7)
     probs = F.softmax(logits, dim=-1)
     return scale * (probs * grid).sum(dim=-1)
 
 def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Tensor,
-                           sensitivity_exp: float = 1.0) -> Tensor:
+                           sensitivity_exp: float, grid: Tensor) -> Tensor:
     """HESTIA-aware ternary forward pass. Replaces standard STE.
-    tau and pressure are scalar Tensors (buffers) for torch.compile compatibility.
-    sensitivity_exp is precomputed exp(0.4 * sensitivity) — a Python float constant per-layer."""
+    All tensor args are buffers for torch.compile. sensitivity_exp is a per-layer constant.
+    grid is a registered buffer [-1, 0, 1] — avoids dict lookup graph breaks."""
     w_bf = w.bfloat16()
     g = group_size
     w_g = w_bf.reshape(-1, g)
     scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
 
-    # Always compute STE path (cheap)
+    # HESTIA soft quantization
+    tau_eff = tau * sensitivity_exp
+    w_soft = hestia_soft_quantize(w_g, scale, tau_eff.clamp(min=1e-7), grid)
+    w_hestia = (1.0 - pressure) * w_g + pressure * w_soft
+
+    # STE fallback: only needed during pressure ramp (first ~20% of training).
+    # After pressure=1.0 permanently, torch.where still evaluates both but STE is
+    # a simple detach chain — much cheaper than the HESTIA softmax it replaces.
     q = (w_g / scale).round().clamp(-1, 1)
     w_ste = w_g + ((q * scale) - w_g).detach()
 
-    # Always compute HESTIA soft path
-    tau_eff = tau * sensitivity_exp  # sensitivity_exp is constant, no graph break
-    w_soft = hestia_soft_quantize(w_g, scale, tau_eff.clamp(min=1e-7))
-    w_hestia = (1.0 - pressure) * w_g + pressure * w_soft
-
-    # Blend: use HESTIA when pressure > 0, otherwise STE
+    # Blend without Python branching
     w_eff = torch.where(pressure > 0, w_hestia, w_ste)
 
     return w_eff.reshape(w.shape)
@@ -821,14 +817,16 @@ class QATEmbedding(nn.Embedding):
 
 class HestiaTernaryLinear(nn.Linear):
     """Ternary linear with HESTIA differentiable QAT (replaces TernaryLinear).
-    Uses tensor buffers for tau/pressure so torch.compile doesn't recompile on value changes."""
+    Uses tensor buffers for tau/pressure/grid so torch.compile doesn't recompile."""
     def __init__(self, in_features, out_features, bias=False, group_size=128):
         super().__init__(in_features, out_features, bias=bias)
         self.group_size = group_size
         self._sensitivity = 0.0
-        self._sensitivity_exp = 1.0  # precomputed exp(0.4 * sensitivity)
+        self._sensitivity_exp = 1.0
         self.register_buffer("hestia_tau", torch.tensor(0.3), persistent=False)
         self.register_buffer("hestia_pressure", torch.tensor(0.0), persistent=False)
+        # Grid as buffer: avoids dict lookup graph breaks under torch.compile
+        self.register_buffer("hestia_grid", torch.tensor([-1.0, 0.0, 1.0]), persistent=False)
 
     @property
     def sensitivity(self):
@@ -843,7 +841,7 @@ class HestiaTernaryLinear(nn.Linear):
         w_ternary = hestia_ternary_forward(
             self.weight, self.group_size,
             self.hestia_tau, self.hestia_pressure,
-            self._sensitivity_exp)
+            self._sensitivity_exp, self.hestia_grid.to(dtype=x.dtype))
         return F.linear(x, w_ternary.to(x.dtype),
                         self.bias.to(x.dtype) if self.bias is not None else None)
 

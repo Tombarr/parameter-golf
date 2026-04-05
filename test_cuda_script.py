@@ -69,7 +69,8 @@ class TestHESTIA(unittest.TestCase):
         g = 128
         w_g = w.reshape(-1, g)
         scale_g = w_g.detach().abs().mean(-1, keepdim=True).clamp(min=1e-8)
-        out = T.hestia_soft_quantize(w_g, scale_g, tau=torch.tensor(0.3))
+        grid = torch.tensor([-1.0, 0.0, 1.0])
+        out = T.hestia_soft_quantize(w_g, scale_g, tau=torch.tensor(0.3), grid=grid)
         out.sum().backward()
         self.assertIsNotNone(w.grad)
         self.assertGreater(w.grad.abs().sum().item(), 0)
@@ -82,8 +83,9 @@ class TestHESTIA(unittest.TestCase):
         scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
         q_hard = (w_g / scale).round().clamp(-1, 1) * scale
         errors = []
+        grid = torch.tensor([-1.0, 0.0, 1.0])
         for tau in [1.0, 0.01, 0.001]:
-            soft = T.hestia_soft_quantize(w_g, scale, torch.tensor(tau))
+            soft = T.hestia_soft_quantize(w_g, scale, torch.tensor(tau), grid)
             errors.append((soft - q_hard).abs().mean().item())
         self.assertLess(errors[-1], errors[0] * 0.1)
 
@@ -92,7 +94,8 @@ class TestHESTIA(unittest.TestCase):
         w = torch.randn(64, 128, requires_grad=True)
         tau = torch.tensor(0.3)
         pressure = torch.tensor(0.0)
-        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0)
+        grid = torch.tensor([-1.0, 0.0, 1.0])
+        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0, grid=grid)
         self.assertEqual(out.shape, w.shape)
         out.sum().backward()
         self.assertIsNotNone(w.grad)
@@ -101,7 +104,8 @@ class TestHESTIA(unittest.TestCase):
         w = torch.randn(64, 128, requires_grad=True)
         tau = torch.tensor(0.1)
         pressure = torch.tensor(0.5)
-        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0)
+        grid = torch.tensor([-1.0, 0.0, 1.0])
+        out = T.hestia_ternary_forward(w, group_size=128, tau=tau, pressure=pressure, sensitivity_exp=1.0, grid=grid)
         self.assertEqual(out.shape, w.shape)
         out.sum().backward()
         self.assertIsNotNone(w.grad)
