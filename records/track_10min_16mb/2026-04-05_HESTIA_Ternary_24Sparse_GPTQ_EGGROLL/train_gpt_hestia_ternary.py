@@ -18,25 +18,32 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+def _sdpa_fallback(q, k, v, causal=False):
+    """Fallback for non-Hopper GPUs: uses PyTorch SDPA."""
+    B, S, H, D = q.shape
+    KVH = k.shape[2]
+    if KVH < H:
+        rep = H // KVH
+        k = k.repeat_interleave(rep, dim=2)
+        v = v.repeat_interleave(rep, dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    return y.transpose(1, 2)
+
+# Use FA3 only on Hopper+ (compute capability >= 9.0)
+_FA3_AVAILABLE = False
 try:
-    from flash_attn_interface import flash_attn_func
-    _FA3_AVAILABLE = True
+    if torch.cuda.is_available():
+        _cc = torch.cuda.get_device_capability()
+        if _cc[0] >= 9:
+            from flash_attn_interface import flash_attn_func
+            _FA3_AVAILABLE = True
+    if not _FA3_AVAILABLE:
+        flash_attn_func = _sdpa_fallback
 except ImportError:
-    _FA3_AVAILABLE = False
-    def flash_attn_func(q, k, v, causal=False):
-        """Fallback for non-Hopper GPUs: uses PyTorch SDPA."""
-        # q: (B, S, H, D) -> (B, H, S, D)
-        B, S, H, D = q.shape
-        KVH = k.shape[2]
-        if KVH < H:
-            rep = H // KVH
-            k = k.repeat_interleave(rep, dim=2)
-            v = v.repeat_interleave(rep, dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-        return y.transpose(1, 2)  # (B, S, H, D)
+    flash_attn_func = _sdpa_fallback
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (all configurable via environment variables)
@@ -1051,20 +1058,21 @@ class GPT(nn.Module):
         self.eval()
         tokens = torch.zeros(n_seqs, 1, dtype=torch.long, device=device)
         for _ in range(max_len - 1):
-            x = self.tok_emb(tokens).float()
-            if self.embed_proj is not None: x = self.embed_proj(x)
-            x = F.rms_norm(x, (x.size(-1),))
-            x0 = x
-            skips = []
-            for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0); skips.append(x)
-            for i in range(self.num_decoder_layers):
-                bi = self.num_encoder_layers + i
-                if skips: x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
-                x = self.blocks[bi](x, x0)
-            x = self.final_norm(x)
-            logits = self._softcap(self._compute_logits(x[:, -1:, :].reshape(-1, x.size(-1))))
-            probs = F.softmax(logits / temperature, dim=-1)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                x = self.tok_emb(tokens).float()
+                if self.embed_proj is not None: x = self.embed_proj(x)
+                x = F.rms_norm(x, (x.size(-1),))
+                x0 = x
+                skips = []
+                for i in range(self.num_encoder_layers):
+                    x = self.blocks[i](x, x0); skips.append(x)
+                for i in range(self.num_decoder_layers):
+                    bi = self.num_encoder_layers + i
+                    if skips: x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
+                    x = self.blocks[bi](x, x0)
+                x = self.final_norm(x)
+                logits = self._softcap(self._compute_logits(x[:, -1:, :].reshape(-1, x.size(-1))))
+            probs = F.softmax(logits.float() / temperature, dim=-1)
             next_tok = torch.multinomial(probs, 1)
             tokens = torch.cat([tokens, next_tok], dim=1)
         self.train()
