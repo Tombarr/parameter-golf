@@ -365,8 +365,8 @@ def eggroll_refine(model, val_tokens, device, max_seconds=60, candidates_per_ite
     # Get a small eval batch for fast loss computation
     seq_len = 1024
     n_seqs = min(32, (val_tokens.numel() - 1) // seq_len)
-    eval_x = val_tokens[:n_seqs * seq_len].reshape(n_seqs, seq_len).to(device)
-    eval_y = val_tokens[1:n_seqs * seq_len + 1].reshape(n_seqs, seq_len).to(device)
+    eval_x = val_tokens[:n_seqs * seq_len].reshape(n_seqs, seq_len).to(device=device, dtype=torch.long)
+    eval_y = val_tokens[1:n_seqs * seq_len + 1].reshape(n_seqs, seq_len).to(device=device, dtype=torch.long)
 
     # Compute baseline loss
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -517,9 +517,21 @@ def q_sd(state_dict: dict, group_size: int = 128, fp_storage=False,
                 q = (t_grouped / scale).round().clamp(-1, 1).to(torch.int8)
 
             if use_2_4:
-                # Enforce 2:4 structure and pack
-                q_flat = q.reshape(-1).float()
-                q_24 = enforce_2_4_structure(q_flat).to(torch.int8)
+                # Enforce 2:4 structure using ORIGINAL continuous weights to pick
+                # which 2 of 4 to keep, then apply mask to ternary values
+                t_flat = t_padded.reshape(-1)
+                pad4 = (4 - t_flat.numel() % 4) % 4
+                if pad4 > 0:
+                    t_flat = F.pad(t_flat, (0, pad4))
+                groups_cont = t_flat.reshape(-1, 4)
+                _, top2 = groups_cont.abs().topk(2, dim=-1)
+                mask = torch.zeros_like(groups_cont)
+                mask.scatter_(1, top2, 1.0)
+                # Apply mask to the ternary values
+                q_flat_raw = q.reshape(-1).float()
+                if pad4 > 0:
+                    q_flat_raw = F.pad(q_flat_raw, (0, pad4))
+                q_24 = (q_flat_raw.reshape(-1, 4) * mask).reshape(-1).to(torch.int8)
                 packed_bytes, n_groups = pack_2_4_ternary(q_24)
                 quantized[name] = {
                     "type": "ternary_2_4",
