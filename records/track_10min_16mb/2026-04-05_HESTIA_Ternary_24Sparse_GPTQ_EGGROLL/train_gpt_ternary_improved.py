@@ -126,6 +126,8 @@ class Hyperparameters:
     temp_scaling = _e("TEMP_SCALING", 0, bool)
     ln_scale = _e("LN_SCALE", 0, bool)
     xsa_last_n = _e("XSA_LAST_N", 0, int)
+    rope_dims = _e("ROPE_DIMS", 0, int)
+    overtone_init = _e("OVERTONE_INIT", 0, bool)
     _fp_raw = os.environ.get("FP_STORAGE", "0")
     fp_storage = True if _fp_raw == "FP8" else ("fp4" if _fp_raw == "FP4" else False)
 
@@ -587,14 +589,17 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0, no_cache: bool = False,
-                 rope_type: str = "rope", yarn_max_len: int = 4096, train_seq_len: int = 1024):
+                 rope_type: str = "rope", yarn_max_len: int = 4096, train_seq_len: int = 1024,
+                 rope_dims: int = 0):
         super().__init__()
         self.no_cache = no_cache
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        rd = rope_dims if rope_dims > 0 else dim
+        self.rope_dims = rd
+        inv_freq = 1.0 / (base ** (torch.arange(0, rd, 2, dtype=torch.float32) / rd))
         if rope_type == "yarn":
             scale = train_seq_len / yarn_max_len
-            freq_idx = torch.arange(0, dim, 2, dtype=torch.float32)
-            ramp = torch.clamp((freq_idx / dim - 0.25) / 0.75, 0.0, 1.0)
+            freq_idx = torch.arange(0, rd, 2, dtype=torch.float32)
+            ramp = torch.clamp((freq_idx / rd - 0.25) / 0.75, 0.0, 1.0)
             inv_freq = inv_freq / (ramp * (1.0 / scale - 1.0) + 1.0)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
@@ -620,6 +625,14 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    rd = cos.size(-1) * 2  # rotary dims = 2 * freq dims
+    if rd < x.size(-1):
+        # Partial RoPE: only rotate first rd dims, pass through the rest
+        x_rope, x_pass = x[..., :rd], x[..., rd:]
+        half = rd // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rot, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -629,7 +642,7 @@ class CausalSelfAttention(nn.Module):
                  group_size=64, attn_proj_type="standard", tversky_num_features=16,
                  tversky_feature_pools=0, no_cache=False, rope_type="rope",
                  yarn_max_len=4096, train_seq_len=1024, tversky_membership="sigmoid",
-                 diff_attn=False):
+                 diff_attn=False, rope_dims=0):
         super().__init__()
         self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
         self.head_dim = dim // num_heads
@@ -652,7 +665,7 @@ class CausalSelfAttention(nn.Module):
             self.diff_lambda = nn.Parameter(torch.full((num_heads,), 0.5, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base, no_cache=no_cache,
                              rope_type=rope_type, yarn_max_len=yarn_max_len,
-                             train_seq_len=train_seq_len)
+                             train_seq_len=train_seq_len, rope_dims=rope_dims)
         self.use_xsa = False  # set by GPT.__init__ for deep layers
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
@@ -766,14 +779,14 @@ class Block(nn.Module):
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn: bool=False, mlp_groups: int=0, layer_idx: int=0,
-                 ln_scale: bool=False):
+                 ln_scale: bool=False, rope_dims: int=0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         group_size, attn_proj_type, tversky_num_features,
                                         tversky_feature_pools, no_cache, rope_type, yarn_max_len,
-                                        train_seq_len, tversky_membership, diff_attn)
+                                        train_seq_len, tversky_membership, diff_attn, rope_dims)
         self.mlp = MLP(dim, mlp_mult, group_size, activation, mlp_groups)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -804,7 +817,7 @@ class GPT(nn.Module):
                  smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn=False, mlp_groups=0, refiner=False, refiner_kernel=3,
-                 ln_scale=False, xsa_last_n=0):
+                 ln_scale=False, xsa_last_n=0, rope_dims=0, overtone_init=False):
         super().__init__()
         self.training_depth_recurrence = training_depth_recurrence
         self.fp_storage = fp_storage
@@ -839,7 +852,7 @@ class GPT(nn.Module):
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   group_size, activation, attn_proj_type, tversky_num_features, tversky_feature_pools,
                   no_cache, smear, rope_type, yarn_max_len, train_seq_len, tversky_membership,
-                  diff_attn, mlp_groups, layer_idx=i, ln_scale=ln_scale)
+                  diff_attn, mlp_groups, layer_idx=i, ln_scale=ln_scale, rope_dims=rope_dims)
             for i in range(num_layers)
         ])
 
@@ -877,11 +890,17 @@ class GPT(nn.Module):
             self.lm_head.weight.requires_grad_(False)
 
         self.vocab_bias = nn.Parameter(torch.zeros(vocab_size, dtype=torch.float32))
-        self._init_weights(tied_embed_init_std)
+        self._init_weights(tied_embed_init_std, overtone_init)
 
-    def _init_weights(self, tied_embed_init_std: float) -> None:
+    def _init_weights(self, tied_embed_init_std: float, overtone_init: bool = False) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
+            if overtone_init:
+                # OvertoneInit: shape embedding spectrum to power-law decay
+                with torch.no_grad():
+                    U, S, V = torch.linalg.svd(self.tok_emb.weight.data, full_matrices=False)
+                    target_S = S[0] * (1.0 / torch.arange(1, S.shape[0] + 1, dtype=S.dtype)) ** 0.5
+                    self.tok_emb.weight.data = (U * target_S[None, :]) @ V
         for module in self.modules():
             if isinstance(module, TernaryLinear) and not getattr(module, "_zero_init", False):
                 nn.init.orthogonal_(module.weight)
@@ -1041,6 +1060,7 @@ def eval_val_sliding(args, model, rank, world_size, device, grad_accum_steps, va
                      stride: int = 64, temperature: float = 1.0):
     seq_len = args.train_seq_len
     batch_size = args.sliding_batch_size
+    _val_tokens_long = val_tokens.long()  # cache uint16→int64 conversion once
     total_tokens = val_tokens.numel() - 1
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1057,7 +1077,7 @@ def eval_val_sliding(args, model, rank, world_size, device, grad_accum_steps, va
             offsets = torch.arange(seq_len + 1, dtype=torch.int64)
             indices = starts_t.unsqueeze(1) + offsets.unsqueeze(0)
 
-            local_batch = val_tokens.long()[indices].to(device=device, dtype=torch.int64, non_blocking=True)
+            local_batch = _val_tokens_long[indices].to(device=device, non_blocking=True)
             x = local_batch[:, :-1]
             y = local_batch[:, 1:]
 
@@ -1174,7 +1194,8 @@ def main() -> None:
         smear=args.smear, rope_type=args.rope_type, yarn_max_len=args.yarn_max_len, train_seq_len=args.train_seq_len,
         tversky_membership=args.tversky_membership, diff_attn=args.diff_attn,
         refiner=args.refiner, refiner_kernel=args.refiner_kernel, mlp_groups=args.mlp_groups,
-        ln_scale=args.ln_scale, xsa_last_n=args.xsa_last_n,
+        ln_scale=args.ln_scale, xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims,
+        overtone_init=args.overtone_init,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
