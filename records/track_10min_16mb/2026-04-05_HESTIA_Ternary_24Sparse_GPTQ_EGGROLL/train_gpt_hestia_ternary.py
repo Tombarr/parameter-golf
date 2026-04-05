@@ -286,7 +286,7 @@ def hestia_ternary_forward(w: Tensor, group_size: int, tau: Tensor, pressure: Te
     scale = w_g.abs().mean(-1, keepdim=True).clamp(min=1e-8)
 
     # HESTIA soft quantization
-    tau_eff = tau * sensitivity_exp
+    tau_eff = tau.clamp(min=0.1) * sensitivity_exp
     w_soft = hestia_soft_quantize(w_g, scale, tau_eff.clamp(min=1e-7), grid)
     w_hestia = (1.0 - pressure) * w_g + pressure * w_soft
 
