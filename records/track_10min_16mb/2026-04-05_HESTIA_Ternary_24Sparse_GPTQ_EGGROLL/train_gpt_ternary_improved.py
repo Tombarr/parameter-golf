@@ -286,11 +286,17 @@ def deq_sd(quantized: dict, target_dtype=torch.bfloat16):
 # ---------------------------------------------------------------------------
 # Ternary diagnostics (logged during training)
 # ---------------------------------------------------------------------------
+def _is_ternary_param(name: str, p: Tensor) -> bool:
+    return (p.ndim == 2 and ("weight" in name or "prototypes" in name) and p.shape[0] > 1
+            and "tok_emb" not in name and "embed_proj" not in name
+            and "bigram_emb" not in name and "engram" not in name
+            and "lm_head" not in name and "lm_head_correction" not in name)
+
 def tern_stats(model: nn.Module, group_size: int = 64):
     total = zeros = 0
     with torch.no_grad():
         for name, p in model.named_parameters():
-            if p.ndim == 2 and ("weight" in name or "prototypes" in name) and p.shape[0] > 1:
+            if _is_ternary_param(name, p):
                 w = p.detach().float().reshape(-1, group_size)
                 scale = w.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
                 q = (w / scale).round().clamp(-1, 1)
@@ -305,7 +311,7 @@ def churn_fn(model: nn.Module, group_size: int = 64):
     total = flipped = 0
     with torch.no_grad():
         for name, p in model.named_parameters():
-            if p.ndim == 2 and ("weight" in name or "prototypes" in name) and p.shape[0] > 1:
+            if _is_ternary_param(name, p):
                 w = p.detach().float().reshape(-1, group_size)
                 scale = w.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
                 q = (w / scale).round().clamp(-1, 1).cpu().numpy()
